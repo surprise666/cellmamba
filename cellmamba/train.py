@@ -17,7 +17,7 @@ import numpy as np
 import random
 
 from configs.config import config
-from models.cellmamba import build_model
+from models.cellmamba_mvp import build_model
 from utils.dataset import CoNSePDataset, SlidingWindowDataset, get_train_val_split
 from utils.fcos_target import compute_fcos_targets
 from utils.losses import CellMambaLoss
@@ -245,10 +245,9 @@ def main():
     model = build_model(config)
     model = model.to(device)
     
-    # Get actual strides from model (to match output sizes)
-    from utils.fcos_target import get_model_strides
-    actual_strides = get_model_strides(model, config.PATCH_SIZE)
-    print(f"Model actual strides: {actual_strides}")
+    # Get actual strides from model
+    actual_strides = model.strides
+    print(f"Model strides: {actual_strides}")
     print(f"Config strides: {config.STRIDES}")
     
     # Count parameters

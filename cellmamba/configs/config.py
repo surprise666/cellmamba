@@ -69,7 +69,7 @@ class Config:
     TMAC_EPOCH_THRESHOLD = 35
     
     # ============== Inference ==============
-    CONF_THRESH = 0.3
+    CONF_THRESH = 0.3  # 恢复正常阈值
     NMS_THRESH = 0.5
     MAX_DETECTIONS = 100
     

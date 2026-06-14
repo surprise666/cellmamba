@@ -18,7 +18,7 @@ import cv2
 import matplotlib.pyplot as plt
 
 from configs.config import config
-from models.cellmamba import build_model
+from models.cellmamba_mvp import build_model
 from utils.dataset import parse_consep_label
 
 
@@ -590,10 +590,9 @@ def main():
     print("\nBuilding model...")
     model = build_model(config).to(device)
     
-    # Get actual strides from model
-    from utils.fcos_target import get_model_strides
-    actual_strides = get_model_strides(model, config.PATCH_SIZE)
-    print(f"Model actual strides: {actual_strides}")
+    # Get strides from model (new MVP model has [4, 8, 16, 32, 64])
+    actual_strides = model.strides
+    print(f"Model strides: {actual_strides}")
     
     # Load checkpoint if exists
     checkpoint_path = 'checkpoints/best_model.pth'

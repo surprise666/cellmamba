@@ -197,7 +197,7 @@ def compute_targets(centers_list, image_sizes, strides):
     
     for centers, image_size in zip(centers_list, image_sizes):
         obj_targets, reg_targets = compute_fcos_targets(
-            image_size, centers, strides, center_radius=1.5
+            image_size, centers, strides
         )
         for level_idx in range(num_levels):
             level_obj_targets[level_idx].append(obj_targets[level_idx])

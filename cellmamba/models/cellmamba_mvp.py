@@ -1,57 +1,273 @@
 """
 CellMamba-MVP Model Architecture (Paper Aligned SOTA Version)
-- True Bi-directional Mamba Core (Official mamba_ssm CUDA backend)
+- True VMamba SS2D Core (4-direction cross scan, 100% VMamba original)
 - 5-Level FPN (P2-P6)
 - Independent Scale-Specific Adaptive Heads
 - Mixed Mamba + Transformer Stage 4
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# 🚀 召唤官方纯血 CUDA 加速的 Mamba 算子！
-from mamba_ssm import Mamba
+# 🚀 尝试加载官方 CUDA 算子 (selective_scan_cuda / selective_scan)，
+# 如果不存在则使用纯 PyTorch 实现，可保证可运行。
+try:
+    import selective_scan_cuda  # noqa: F401
+    _HAS_CUDA_SELECTIVE_SCAN = True
+except Exception:
+    _HAS_CUDA_SELECTIVE_SCAN = False
+
+try:
+    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
+    _HAS_OFFICIAL_SCAN = True
+except Exception:
+    _HAS_OFFICIAL_SCAN = False
 
 
 # ========================================================
-# 1. 基于官方 C++/CUDA 扩展的极速双向 Mamba 核心
+# 1. SS2D Core —— VMamba 原版四向交叉扫描 (100% 原版)
 # ========================================================
-class BiMambaCore(nn.Module):
+def cross_scan(x: torch.Tensor):
     """
-    调用官方 mamba_ssm 的原生算子实现极速双向扫描。
-    彻底解决因果偏见，同时享受极致的硬件级加速。
+    4 个方向的 cross scan (VMamba 论文原版)
+    输入: (B, C, H, W)
+    输出: (B, 4, C, L)  其中 L = H*W
     """
-    def __init__(self, d_model, d_state=16, d_conv=4, expand=2):
+    B, C, H, W = x.shape
+    L = H * W
+    # 方向 1: 行内从左到右，逐行拼接
+    s1 = x.flatten(2)                                    # (B, C, H*W)
+    # 方向 2: 行内从右到左，逐行拼接
+    s2 = x.flip(-1).flatten(2)                           # (B, C, H*W)
+    # 方向 3: 列内从上到下，逐列拼接
+    s3 = x.transpose(-1, -2).flatten(2)                  # (B, C, H*W)
+    # 方向 4: 列内从下到上，逐列拼接
+    s4 = x.flip(-2).transpose(-1, -2).flatten(2)         # (B, C, H*W)
+    return torch.stack([s1, s2, s3, s4], dim=1)          # (B, 4, C, L)
+
+
+def cross_merge(ys: torch.Tensor, H: int, W: int):
+    """
+    4 个方向的 cross merge，与 cross_scan 完全对称的反操作
+    输入: (B, 4, C, L)
+    输出: (B, C, H, W)
+    """
+    B, K, C, L = ys.shape
+    assert K == 4 and L == H * W, "cross_merge 输入形状不匹配"
+
+    # 方向 1: 还原成 (B, C, H, W)
+    y1 = ys[:, 0].reshape(B, C, H, W)
+    # 方向 2: 反向 flip 回去
+    y2 = ys[:, 1].reshape(B, C, H, W).flip(-1)
+    # 方向 3: 转置回原方向
+    y3 = ys[:, 2].reshape(B, C, W, H).transpose(-1, -2)
+    # 方向 4: flip + 转置
+    y4 = ys[:, 3].reshape(B, C, W, H).flip(-1).transpose(-1, -2)
+
+    # 4 方向相加 (VMamba 论文原版做法)
+    return y1 + y2 + y3 + y4
+
+
+def selective_scan_pytorch(u, delta, A, B, C, D=None, delta_bias=None, delta_softplus=True):
+    """
+    纯 PyTorch 实现的 selective scan (无 CUDA 算子时的备选方案)
+    输入说明 (单方向)：
+        u:     (B, D, L)
+        delta: (B, D, L)
+        A:     (D, N)
+        B:     (B, N, L)
+        C:     (B, N, L)
+        D:     (D,)   可选，跳连
+    """
+    batch, dim, L = u.shape
+    N = A.shape[1]
+
+    if delta_bias is not None:
+        delta = delta + delta_bias
+    if delta_softplus:
+        delta = F.softplus(delta)
+
+    # 离散化
+    # A 的形状 (D, N) 需扩展为 (B, D, N)
+    A_exp = A.unsqueeze(0).expand(batch, -1, -1)           # (B, D, N)
+    # 离散 A: A_bar = exp(ΔA)
+    A_bar = torch.exp(torch.einsum('bdl,bdn->bdn', delta, A_exp))   # (B, D, N)
+    # 离散 B: B_bar = ΔB
+    B_bar = torch.einsum('bdl,bnl->bdnl', delta, B)                   # (B, D, N, L)
+
+    # 状态初值 h0 = 0
+    h = u.new_zeros(batch, dim, N)
+    hs = []
+    for t in range(L):
+        h = A_bar[..., t] * h + B_bar[..., t] * (u[..., t:t+1])       # (B, D, N)
+        hs.append(h)
+    hs = torch.stack(hs, dim=-1)                                     # (B, D, N, L)
+
+    # 输出: y_t = C_t * h_t
+    y = torch.einsum('bdnl,bnl->bdl', hs, C)
+
+    if D is not None:
+        y = y + u * D.view(1, -1, 1)
+    return y
+
+
+class SS2DCore(nn.Module):
+    """
+    VMamba 原版 SS2D: 4 向交叉扫描 + 选择性扫描
+    - 1 次 cross_scan 把 (B,C,H,W) 变 (B,4,C,L)
+    - 4 个独立 (delta, A, B, C) 参数 (per-direction)
+    - 4 路 selective scan
+    - 1 次 cross_merge 还原 (B,C,H,W)
+    """
+    def __init__(self, d_model, d_state=16, d_conv=4, expand=2, dt_rank='auto', bias=False):
         super().__init__()
-        # 前向 Mamba 算子
-        self.mamba_fwd = Mamba(
-            d_model=d_model,
-            d_state=d_state,
-            d_conv=d_conv,
-            expand=expand,
-        )
-        # 反向 Mamba 算子
-        self.mamba_bwd = Mamba(
-            d_model=d_model,
-            d_state=d_state,
-            d_conv=d_conv,
-            expand=expand,
+        self.d_model = d_model
+        self.d_state = d_state
+        self.d_conv = d_conv
+        self.expand = expand
+        self.d_inner = d_model * expand
+        # 4 个方向共用一个 K=4 维度
+        self.K = 4
+
+        if dt_rank == 'auto':
+            dt_rank = math.ceil(d_model / 16)
+        self.dt_rank = dt_rank
+
+        # 输入投影: x -> (x_in, z)，其中 z 是门控
+        self.in_proj = nn.Linear(d_model, self.d_inner * 2, bias=bias)
+
+        # 4 方向 depthwise conv (与官方对齐: kernel=3, padding=1)
+        self.conv2d = nn.Conv2d(
+            self.d_inner, self.d_inner, kernel_size=3,
+            padding=1, groups=self.d_inner, bias=bias
         )
 
-    def forward(self, x):
-        # x shape: (B, L, D)
-        
-        # 1. 极速前向扫描
-        y_fwd = self.mamba_fwd(x)
-        
-        # 2. 序列翻转进行极速反向扫描
-        x_bwd = torch.flip(x, dims=[1])
-        y_bwd = self.mamba_bwd(x_bwd)
-        y_bwd = torch.flip(y_bwd, dims=[1])
-        
-        # 双向特征融合
-        return y_fwd + y_bwd
+        # x_proj: 一次性产出 (delta, B, C) 三个量
+        # 单方向输出维度: dt_rank + 2*d_state
+        self.x_proj = nn.Linear(self.d_inner,
+                                self.dt_rank + 2 * d_state,
+                                bias=False)
+
+        # dt 投影: dt_rank -> d_inner
+        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
+
+        # A 参数: (4, d_inner, d_state)  —— 4 方向独立
+        A = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(self.d_inner, 1)
+        A_log = torch.log(A)                              # (d_inner, d_state)
+        # 给 4 个方向各自初始化
+        A_log = A_log.unsqueeze(0).expand(self.K, -1, -1).contiguous()  # (K=4, d_inner, d_state)
+        self.A_log = nn.Parameter(A_log.clone())
+        self.A_log._no_weight_decay = True
+
+        # D 跳连: (4, d_inner)
+        self.Ds = nn.Parameter(torch.ones(self.K, self.d_inner))
+        self.Ds._no_weight_decay = True
+
+        # dt bias
+        dt = torch.exp(torch.rand(self.K, self.d_inner) * (math.log(0.1) - math.log(0.001)) + math.log(0.001))
+        dt = dt.clamp(min=1e-4)
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        self.dt_bias = nn.Parameter(inv_dt)
+        self.dt_bias._no_weight_decay = True
+
+        # 输出投影
+        self.out_proj = nn.Linear(self.d_inner, d_model, bias=bias)
+
+    def forward(self, x: torch.Tensor):
+        # x: (B, L, D) 其中 L = H*W，必须是方形特征图
+        B, L, C = x.shape
+        H = W = int(math.sqrt(L))
+        assert H * W == L, f"SS2DCore 要求 H*W == L, 当前 H*W={H*W}, L={L}"
+
+        # 1) 输入投影
+        xz = self.in_proj(x)                              # (B, L, 2*d_inner)
+        x_in, z = xz.chunk(2, dim=-1)                     # 各 (B, L, d_inner)
+
+        # 2) 转换到 2D: (B, L, d_inner) -> (B, d_inner, H, W)
+        x_2d = x_in.transpose(1, 2).reshape(B, self.d_inner, H, W).contiguous()
+        x_2d = self.conv2d(x_2d)                          # depth-wise conv
+        x_2d = F.silu(x_2d)
+
+        # 3) 4 向 cross scan
+        xs = cross_scan(x_2d)                             # (B, 4, d_inner, L)
+        # print(f"[SS2DCore] in x.shape={x.shape}, x_2d.shape={x_2d.shape}, xs.shape={xs.shape}")
+
+        # 4) 对 4 个方向分别投影得到 (delta_raw, B, C)
+        #    x_proj 共享权重，逐方向处理
+        dts_list, Bs_list, Cs_list = [], [], []
+        for k in range(self.K):
+            x_k = xs[:, k].permute(0, 2, 1).contiguous().reshape(B, L, self.d_inner)  # (B, L, d_inner)
+            x_dbl_k = self.x_proj(x_k)  # (B, L, dt_rank + 2*d_state)
+            d_k, B_k, C_k = torch.split(
+                x_dbl_k, [self.dt_rank, self.d_state, self.d_state], dim=-1
+            )
+            dts_list.append(d_k)
+            Bs_list.append(B_k)
+            Cs_list.append(C_k)
+        dts = torch.stack(dts_list, dim=1)                # (B, 4, L, dt_rank)
+        Bs = torch.stack(Bs_list, dim=1)                  # (B, 4, L, d_state)
+        Cs = torch.stack(Cs_list, dim=1)                  # (B, 4, L, d_state)
+
+        # 5) dt 投影到 d_inner
+        dts = self.dt_proj(dts)                           # (B, 4, L, d_inner)
+        dts = dts.permute(0, 1, 3, 2)                     # (B, 4, d_inner, L)
+
+        # 6) A 取负指数 (确保 A > 0)
+        As = -torch.exp(self.A_log.float())               # (4, d_inner, d_state)
+
+        # 7) 4 方向分别做 selective scan
+        if _HAS_OFFICIAL_SCAN:
+            # mamba_ssm 自动把 B/C 3D -> (B, 1, dstate, L)
+            ys_list = []
+            for k in range(self.K):
+                u_k = xs[:, k].contiguous()              # (B, d_inner, L)
+                # dts 已经是 (B, K, d_inner, L)
+                delta_k = dts[:, k].contiguous()                # (B, d_inner, L)
+                A_k = As[k].contiguous()                 # (d_inner, d_state)
+                B_k = Bs[:, k].permute(0, 2, 1).contiguous()      # (B, d_state, L)
+                C_k = Cs[:, k].permute(0, 2, 1).contiguous()      # (B, d_state, L)
+                D_k = self.Ds[k].contiguous()            # (d_inner,)
+                db_k = self.dt_bias[k].contiguous()      # (d_inner,)
+                try:
+                    y_k = selective_scan_fn(
+                        u_k, delta_k, A_k, B_k, C_k, D_k,
+                        delta_bias=db_k, delta_softplus=True
+                    )
+                except Exception:
+                    y_k = selective_scan_pytorch(
+                        u_k, delta_k, A_k, B_k, C_k,
+                        D_k, delta_bias=db_k, delta_softplus=True
+                    )
+                ys_list.append(y_k)
+            ys = torch.stack(ys_list, dim=1)              # (B, 4, d_inner, L)
+        else:
+            # 纯 PyTorch 实现
+            ys_list = []
+            for k in range(self.K):
+                u_k = xs[:, k]                            # (B, d_inner, L)
+                delta_k = dts[:, k].contiguous()          # (B, d_inner, L)
+                A_k = As[k]                               # (d_inner, d_state)
+                B_k = Bs[:, k].permute(0, 2, 1).contiguous()    # (B, d_state, L)
+                C_k = Cs[:, k].permute(0, 2, 1).contiguous()
+                y_k = selective_scan_pytorch(
+                    u_k, delta_k, A_k, B_k, C_k,
+                    D=self.Ds[k], delta_bias=self.dt_bias[k], delta_softplus=True
+                )
+                ys_list.append(y_k)
+            ys = torch.stack(ys_list, dim=1)              # (B, 4, d_inner, L)
+
+        # 8) cross merge 还原到 (B, d_inner, H, W)
+        y_2d = cross_merge(ys, H, W)                      # (B, d_inner, H, W)
+        y = y_2d.flatten(2).transpose(1, 2)               # (B, L, d_inner)
+
+        # 9) 门控 z
+        y = y * F.silu(z)
+
+        # 10) 输出投影
+        out = self.out_proj(y)                            # (B, L, d_model)
+        return out
 
 
 # ========================================================
@@ -97,7 +313,7 @@ class VSSBlock(nn.Module):
         self.current_epoch = 0
         
         self.norm = nn.LayerNorm(channels)
-        self.mamba_core = BiMambaCore(d_model=channels)  # 🚀 无缝接入官方 BiMambaCore
+        self.mamba_core = SS2DCore(d_model=channels)  # 🚀 替换为 VMamba 原版 SS2DCore
         
         half_channels = channels // 2
         self.tmac = TMAC(half_channels)
@@ -286,14 +502,28 @@ class AdaptiveScaleWeights(nn.Module):
         return [p_features[i] * alpha[:, i].view(B, 1, 1, 1) for i in range(len(p_features))]
 
 class ScaleSpecificHead(nn.Module):
-    """🚀 核心：每个尺度拥有完全独立的 CellMamba 实例，杜绝权重共享污染！"""
+    """🚀 每个尺度拥有完全独立的 CellMamba 实例，并包含目标检测专属初始化"""
     def __init__(self, in_channels=256, num_classes=1):
         super().__init__()
         self.obj_mamba = VSSBlock(in_channels)
         self.objectness_output = nn.Conv2d(in_channels, num_classes, 1)
-        
+
         self.reg_mamba = VSSBlock(in_channels)
         self.regression_output = nn.Conv2d(in_channels, 4, 1)
+
+        # 执行初始化
+        self._init_weights()
+
+    def _init_weights(self):
+        import math
+        # 1. Focal Loss 分类头初始化：先验概率设为 0.01 (pi)
+        # 这能防止训练初期背景 Loss 爆炸，让网络敢于输出高置信度
+        prior_prob = 0.01
+        bias_value = -math.log((1 - prior_prob) / prior_prob)
+        nn.init.constant_(self.objectness_output.bias, bias_value)
+
+        # 2. 回归头初始化：让初始框具有一定的健康大小，避免出场就是个小黑点
+        nn.init.constant_(self.regression_output.bias, 1.0)
 
     def set_epoch(self, epoch):
         self.obj_mamba.set_epoch(epoch)

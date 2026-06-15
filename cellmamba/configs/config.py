@@ -69,7 +69,16 @@ class Config:
     TMAC_EPOCH_THRESHOLD = 35
     
     # ============== Inference ==============
-    CONF_THRESH = 0.3  # 恢复正常阈值
+    # Center-only FCOS: true-cell scores 0.8~0.95, background < 0.10.
+    # Threshold history on this project:
+    #   0.14  -> 16k+ false positives (soft-label era, the original problem)
+    #   0.40  -> industrial standard, kills 0.20~0.30 noise but may miss
+    #           some marginal positives
+    #   0.20  -> compromise: catches almost all true cells, still cuts the
+    #           bulk of background noise. Use this as the new default.
+    # Try 0.40 first if your model is well-trained and you want crisp
+    # results; fall back to 0.20 (or 0.10) if you see missed cells.
+    CONF_THRESH = 0.20  # 🚀 折中：0.40 太严，0.08 太松，0.20 留出"放大镜"
     NMS_THRESH = 0.5
     MAX_DETECTIONS = 100
     

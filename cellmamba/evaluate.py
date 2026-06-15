@@ -73,7 +73,7 @@ def compute_iou(box1, box2):
     return inter_area / (box1_area + box2_area - inter_area + 1e-6)
 
 
-def decode_predictions(objectness_list, regression_list, strides, conf_thresh=0.3, nms_thresh=0.45):
+def decode_predictions(objectness_list, regression_list, strides, conf_thresh=0.20, nms_thresh=0.45):
     """
     Decode predictions from all FPN levels to bounding boxes
     
@@ -128,7 +128,7 @@ def decode_predictions(objectness_list, regression_list, strides, conf_thresh=0.
     return np.zeros((0, 4)), np.zeros((0,))
 
 
-def sliding_window_inference(model, image_numpy, device, strides, patch_size=256, overlaps=64, conf_thresh=0.3):
+def sliding_window_inference(model, image_numpy, device, strides, patch_size=256, overlaps=64, conf_thresh=0.20):
     """
     Industrial-grade sliding window inference
     
@@ -227,7 +227,7 @@ def compute_ap(gt_boxes, pred_boxes, pred_scores, iou_threshold=0.5):
     return f1, tp, fp, fn, len(gt_boxes)
 
 
-def evaluate_model(model, dataloader, device, strides, conf_thresh=0.3):
+def evaluate_model(model, dataloader, device, strides, conf_thresh=0.20):
     """Evaluate model on dataset"""
     model.eval()
     all_tp, all_fp, all_fn, all_gt, all_pred = 0, 0, 0, 0, 0
@@ -270,7 +270,7 @@ def evaluate_model(model, dataloader, device, strides, conf_thresh=0.3):
     }
 
 
-def visualize_results(dataset, model, device, strides, output_dir='eval_results', num_samples=3, conf_thresh=0.3):
+def visualize_results(dataset, model, device, strides, output_dir='eval_results', num_samples=3, conf_thresh=0.20):
     """Generate visualization comparing GT and predictions"""
     os.makedirs(output_dir, exist_ok=True)
     model.eval()

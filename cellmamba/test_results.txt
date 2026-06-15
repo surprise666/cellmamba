@@ -3,15 +3,15 @@ CellMamba Evaluation Results
 
 Patch size: 256x256
 FPN levels: [4, 8, 16, 32, 64]
-Confidence threshold: 0.05
+Confidence threshold: 0.2
 
-mAP@50: 0.0148
-mAP@75: 0.0008
-mAP: 0.0078
-Precision: 0.0148
-Recall: 0.3636
-F1-score: 0.0284
+mAP@50: 0.0000
+mAP@75: 0.0000
+mAP: 0.0000
+Precision: 0.0000
+Recall: 0.0000
+F1-score: 0.0000
 
 Ground Truth: 8777
-Predictions: 216290
-TP: 3191, FP: 213099, FN: 5586
+Predictions: 0
+TP: 0, FP: 0, FN: 8777

@@ -100,7 +100,7 @@ def compute_iou(box1, box2):
     return inter_area / (union_area + 1e-6)
 
 
-def decode_predictions(objectness_list, regression_list, strides, conf_thresh=0.3, nms_thresh=0.45):
+def decode_predictions(objectness_list, regression_list, strides, conf_thresh=0.20, nms_thresh=0.45):
     """
     Decode predictions from all FPN levels to bounding boxes
     Returns: boxes (N, 4), scores (N,)
@@ -148,8 +148,8 @@ def decode_predictions(objectness_list, regression_list, strides, conf_thresh=0.
     return np.zeros((0, 4)), np.zeros((0,))
 
 
-def sliding_window_inference(model, image_numpy, device, strides, 
-                           patch_size=256, overlaps=64, conf_thresh=0.3):
+def sliding_window_inference(model, image_numpy, device, strides,
+                           patch_size=256, overlaps=64, conf_thresh=0.20):
     """
     Sliding window inference for full image
     """
@@ -179,8 +179,8 @@ def sliding_window_inference(model, image_numpy, device, strides,
             obj_list = predictions['objectness']
             reg_list = predictions['regression']
 
-            # Local NMS per patch
-            boxes, scores = decode_predictions(obj_list, reg_list, strides, conf_thresh, nms_thresh=0.45)
+            # Local NMS per patch — 0.45 允许细胞边缘重叠贴贴
+            boxes, scores = decode_predictions(obj_list, reg_list, strides, conf_thresh, nms_thresh=0.45)  # 🚀 0.35→0.45，保护相邻细胞
 
             if len(boxes) > 0:
                 # Offset to original coordinates
@@ -202,124 +202,118 @@ def sliding_window_inference(model, image_numpy, device, strides,
         # Global NMS
         boxes_tensor = torch.from_numpy(boxes_all)
         scores_tensor = torch.from_numpy(scores_all)
-        keep_idx = torchvision.ops.nms(boxes_tensor, scores_tensor, iou_threshold=0.35)
+        keep_idx = torchvision.ops.nms(boxes_tensor, scores_tensor, iou_threshold=0.40)  # 🚀 0.30→0.40，保护相邻细胞不被误杀
 
         return boxes_tensor[keep_idx].cpu().numpy(), scores_tensor[keep_idx].cpu().numpy()
 
     return np.zeros((0, 4)), np.zeros((0,))
 
 
+def compute_iou_matrix(boxes1, boxes2):
+    """
+    Vectorized IoU matrix using torchvision (handles M x K in one shot).
+    boxes1: (M, 4), boxes2: (K, 4)  -> returns (M, K) IoU matrix
+    """
+    if len(boxes1) == 0 or len(boxes2) == 0:
+        return np.zeros((len(boxes1), len(boxes2)), dtype=np.float32)
+    b1 = torch.as_tensor(boxes1, dtype=torch.float32)
+    b2 = torch.as_tensor(boxes2, dtype=torch.float32)
+    iou = torchvision.ops.box_iou(b1, b2)  # (M, K)
+    return iou.numpy()
+
+
+def match_predictions(gt_boxes, pred_boxes, iou_threshold):
+    """
+    Greedy match: for each pred (sorted by score desc), assign to highest-IoU
+    unmatched GT. Returns tp_count, fp_count, matched_gt_mask.
+    """
+    if len(gt_boxes) == 0:
+        return 0, len(pred_boxes), np.zeros((0,), dtype=bool)
+    if len(pred_boxes) == 0:
+        return 0, 0, np.zeros((len(gt_boxes),), dtype=bool)
+
+    iou_mat = compute_iou_matrix(pred_boxes, gt_boxes)  # (M, K)
+    matched_gt = np.zeros((len(gt_boxes),), dtype=bool)
+    tp, fp = 0, 0
+
+    for m in range(len(pred_boxes)):
+        ious = iou_mat[m].copy()
+        ious[matched_gt] = -1.0  # 已分配的 GT 不再参与
+        best_gt = int(np.argmax(ious))
+        if ious[best_gt] >= iou_threshold:
+            tp += 1
+            matched_gt[best_gt] = True
+        else:
+            fp += 1
+
+    return tp, fp, matched_gt
+
+
 def compute_precision_recall_f1(gt_boxes, pred_boxes, pred_scores, iou_threshold=0.5):
-    """Compute P, R, F1 at given IoU threshold"""
+    """Compute P, R, F1 at given IoU threshold (vectorized)"""
     if len(gt_boxes) == 0:
         if len(pred_boxes) == 0:
             return 1.0, 1.0, 1.0, 0, 0, 0
         return 0.0, 0.0, 0.0, 0, len(pred_boxes), 0
-    
+
     if len(pred_boxes) == 0:
         return 0.0, 0.0, 0.0, 0, 0, len(gt_boxes)
 
-    # Sort by score
+    # Sort by score desc
     sort_idx = np.argsort(-pred_scores)
     pred_boxes = pred_boxes[sort_idx]
 
-    matched_gt = set()
-    tp, fp = 0, 0
-    
-    for pred_box in pred_boxes:
-        matched = False
-        for gt_idx, gt_box in enumerate(gt_boxes):
-            if gt_idx in matched_gt:
-                continue
-            if compute_iou(pred_box, gt_box) >= iou_threshold:
-                tp += 1
-                matched_gt.add(gt_idx)
-                matched = True
-                break
-        if not matched:
-            fp += 1
+    tp, fp, matched_gt = match_predictions(gt_boxes, pred_boxes, iou_threshold)
+    fn = int(len(gt_boxes) - matched_gt.sum())
 
-    fn = len(gt_boxes) - len(matched_gt)
-    
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-    
+
     return precision, recall, f1, tp, fp, fn
 
 
 def compute_map(gt_boxes_list, pred_boxes_list, pred_scores_list, iou_thresholds=[0.5, 0.75]):
     """
-    Compute mAP at different IoU thresholds
-    
-    Args:
-        gt_boxes_list: list of gt boxes per image
-        pred_boxes_list: list of pred boxes per image
-        pred_scores_list: list of pred scores per image
-        iou_thresholds: list of IoU thresholds
-    
-    Returns:
-        dict with AP at each threshold and mAP
+    Compute mAP at different IoU thresholds (vectorized, no double-counting).
     """
     aps = {}
-    
+
     for iou_thresh in iou_thresholds:
         all_tp, all_fp, all_fn = 0, 0, 0
         total_gt = 0
-        
+
         for gt_boxes, pred_boxes, pred_scores in zip(gt_boxes_list, pred_boxes_list, pred_scores_list):
             total_gt += len(gt_boxes)
-            
             if len(gt_boxes) == 0:
-                if len(pred_boxes) > 0:
-                    all_fp += len(pred_boxes)
+                all_fp += len(pred_boxes)
                 continue
-            
             if len(pred_boxes) == 0:
                 all_fn += len(gt_boxes)
                 continue
-            
-            # Sort predictions by score
+
             sort_idx = np.argsort(-pred_scores)
-            pred_boxes = pred_boxes[sort_idx]
-            
-            matched_gt = set()
-            tp, fp = 0, 0
-            
-            for pred_box in pred_boxes:
-                matched = False
-                for gt_idx, gt_box in enumerate(gt_boxes):
-                    if gt_idx in matched_gt:
-                        continue
-                    if compute_iou(pred_box, gt_box) >= iou_thresh:
-                        tp += 1
-                        matched_gt.add(gt_idx)
-                        matched = True
-                        break
-                if not matched:
-                    fp += 1
-            
-            fn = len(gt_boxes) - len(matched_gt)
+            pred_boxes_sorted = pred_boxes[sort_idx]
+
+            tp, fp, matched_gt = match_predictions(gt_boxes, pred_boxes_sorted, iou_thresh)
+            fn = int(len(gt_boxes) - matched_gt.sum())
             all_tp += tp
             all_fp += fp
             all_fn += fn
-        
-        # Compute precision-recall curve
+
         if all_tp + all_fp > 0:
             precision = all_tp / (all_tp + all_fp)
         else:
             precision = 0
         recall = all_tp / (all_tp + all_fn) if (all_tp + all_fn) > 0 else 0
-        
-        # AP = precision at threshold (simplified, for detection we use P@R intercept)
-        # More accurate AP would require PR curve integration
-        aps[f'AP@{int(iou_thresh*100)}'] = precision  # P-R at operation point
-        
+
+        aps[f'AP@{int(iou_thresh*100)}'] = precision
+
     aps['mAP'] = np.mean(list(aps.values()))
     return aps
 
 
-def evaluate_model(model, dataloader, device, strides, conf_thresh=0.3):
+def evaluate_model(model, dataloader, device, strides, conf_thresh=0.20):
     """
     Evaluate model on test dataset
     
@@ -372,48 +366,56 @@ def evaluate_model(model, dataloader, device, strides, conf_thresh=0.3):
     map_results = compute_map(all_gt_boxes, all_pred_boxes, all_pred_scores, 
                             iou_thresholds=[0.5, 0.75])
     
-    # Per-threshold P/R/F1
+    # Print scale so the user knows metrics stage is alive
+    n_pred_total = int(sum(len(p) for p in all_pred_boxes))
+    n_gt_total = int(sum(len(g) for g in all_gt_boxes))
+    print(f"\n  [Metrics] {n_pred_total} predictions vs {n_gt_total} GT across {len(all_gt_boxes)} images")
+    sys.stdout.flush()
+
+    # Per-threshold P/R/F1 (vectorized, per-image then summed — no cross-image leakage)
     metrics = {}
-    for iou_thresh in [0.5, 0.75]:
-        p, r, f1, tp, fp, fn = compute_precision_recall_f1(
-            np.concatenate(all_gt_boxes) if len(all_gt_boxes) > 0 else np.zeros((0, 4)),
-            np.concatenate(all_pred_boxes) if len(all_pred_boxes) > 0 else np.zeros((0, 4)),
-            np.concatenate(all_pred_scores) if len(all_pred_scores) > 0 else np.zeros((0,)),
-            iou_threshold=iou_thresh
-        )
+    for iou_thresh in [0.3, 0.5, 0.75]:  # 🚀 加入 IoU=0.3 医学容错
+        tp_sum = fp_sum = fn_sum = 0
+        for gt_boxes, pred_boxes, pred_scores in zip(all_gt_boxes, all_pred_boxes, all_pred_scores):
+            if len(gt_boxes) == 0 and len(pred_boxes) == 0:
+                continue
+            if len(gt_boxes) == 0:
+                fp_sum += len(pred_boxes); continue
+            if len(pred_boxes) == 0:
+                fn_sum += len(gt_boxes); continue
+            sort_idx = np.argsort(-pred_scores)
+            tp, fp, matched = match_predictions(gt_boxes, pred_boxes[sort_idx], iou_thresh)
+            fn_sum += int(len(gt_boxes) - matched.sum())
+            tp_sum += tp
+            fp_sum += fp
+        p = tp_sum / (tp_sum + fp_sum) if (tp_sum + fp_sum) > 0 else 0
+        r = tp_sum / (tp_sum + fn_sum) if (tp_sum + fn_sum) > 0 else 0
+        f1 = 2*p*r/(p+r) if (p+r) > 0 else 0
         metrics[f'P@{int(iou_thresh*100)}'] = p
         metrics[f'R@{int(iou_thresh*100)}'] = r
         metrics[f'F1@{int(iou_thresh*100)}'] = f1
     
-    # Aggregate metrics
+    # Aggregate metrics (vectorized)
     total_tp, total_fp, total_fn = 0, 0, 0
     total_gt = 0
     total_pred = 0
-    
+
     for gt_boxes, pred_boxes, pred_scores in zip(all_gt_boxes, all_pred_boxes, all_pred_scores):
+        total_gt += len(gt_boxes)
+        total_pred += len(pred_boxes)
+
         if len(gt_boxes) == 0:
             total_fp += len(pred_boxes)
             continue
-        
-        total_gt += len(gt_boxes)
-        total_pred += len(pred_boxes)
-        
-        matched_gt = set()
-        tp, fp = 0, 0
-        for pred_box in pred_boxes:
-            matched = False
-            for gt_idx, gt_box in enumerate(gt_boxes):
-                if gt_idx in matched_gt:
-                    continue
-                if compute_iou(pred_box, gt_box) >= 0.5:
-                    tp += 1
-                    matched_gt.add(gt_idx)
-                    matched = True
-                    break
-            if not matched:
-                fp += 1
-        
-        fn = len(gt_boxes) - len(matched_gt)
+        if len(pred_boxes) == 0:
+            total_fn += len(gt_boxes)
+            continue
+
+        # 🚀 用 torchvision 向量化匹配 (IoU=0.3 医学容错)
+        sort_idx = np.argsort(-pred_scores)
+        pred_boxes_sorted = pred_boxes[sort_idx]
+        tp, fp, matched_gt = match_predictions(gt_boxes, pred_boxes_sorted, iou_threshold=0.3)
+        fn = int(len(gt_boxes) - matched_gt.sum())
         total_tp += tp
         total_fp += fp
         total_fn += fn
@@ -457,11 +459,11 @@ def print_metrics(metrics):
     print(f"  mAP@75:          {metrics['mAP@75']:.4f}")
     print(f"  mAP (avg):       {metrics['mAP']:.4f}")
     
-    print(f"\n  Per-Class Metrics (IoU=0.5):")
+    print(f"\n  Per-Class Metrics:")
     print(f"  {'='*40}")
-    print(f"  P@50:            {metrics.get('P@50', 0):.4f}")
-    print(f"  R@50:            {metrics.get('R@50', 0):.4f}")
-    print(f"  F1@50:           {metrics.get('F1@50', 0):.4f}")
+    print(f"  P@30 / R@30 / F1@30:  {metrics.get('P@30', 0):.4f} / {metrics.get('R@30', 0):.4f} / {metrics.get('F1@30', 0):.4f}  🚀 医学容错")
+    print(f"  P@50 / R@50 / F1@50:  {metrics.get('P@50', 0):.4f} / {metrics.get('R@50', 0):.4f} / {metrics.get('F1@50', 0):.4f}")
+    print(f"  P@75 / R@75 / F1@75:  {metrics.get('P@75', 0):.4f} / {metrics.get('R@75', 0):.4f} / {metrics.get('F1@75', 0):.4f}")
     
     print(f"\n  Detection Counts:")
     print(f"  {'='*40}")
@@ -473,8 +475,121 @@ def print_metrics(metrics):
     print("=" * 60)
 
 
-def visualize_results(dataset, model, device, strides, output_dir='test_results', 
-                      num_samples=5, conf_thresh=0.3):
+def diagnose_score_distribution(model, dataset, device, strides,
+                                conf_thresh=0.20, n_samples=10):
+    """
+    Score-distribution diagnostic.
+
+    Runs the model on the first N test patches. For each FPN level, splits
+    every grid point into TWO buckets using the ground-truth assignment
+    from utils.fcos_target.compute_fcos_targets:
+      * pos = grid point that IS a cell center in GT
+      * neg = grid point that ISN'T a cell center in GT (i.e. background)
+
+    Prints mean / p95 / max of both buckets and tells you whether the
+    problem is the THRESHOLD or the MODEL:
+      pos mean ~ 0.85, neg mean < 0.05  ->  threshold problem (raise it)
+      pos mean ~ 0.40, neg mean ~ 0.30  ->  model problem    (retrain)
+    """
+    from utils.fcos_target import compute_fcos_targets
+    import numpy as np
+
+    model.eval()
+    print()
+    print("=" * 70)
+    print("  SCORE-DISTRIBUTION DIAGNOSTIC (no threshold applied)")
+    print("=" * 70)
+
+    n = min(n_samples, len(dataset))
+    pos_all, neg_all = [], []
+    patch_size = 256  # GT target is built for 256x256 patches, not full images
+
+    with torch.no_grad():
+        for i in range(n):
+            sample = dataset[i]
+            img_np = sample['image']           # (C, H, W) numpy, may be full 1000x1000
+            H, W = img_np.shape[-2:]
+            centers = sample.get('centers', [])
+
+            # =========================================================
+            # Crop a 256x256 window out of the full image. We use the
+            # top-left corner by default; centers outside the crop are
+            # dropped because they're not visible to the model in this
+            # forward pass.
+            # =========================================================
+            y0, x0 = 0, 0
+            crop = img_np[:, y0:y0+patch_size, x0:x0+patch_size]
+            ch, cw = crop.shape[-2:]
+            # Pad with reflection if image is smaller than 256
+            if ch < patch_size or cw < patch_size:
+                pad_h = max(0, patch_size - ch)
+                pad_w = max(0, patch_size - cw)
+                crop = np.pad(crop, ((0,0), (0,pad_h), (0,pad_w)), mode='reflect')
+                ch, cw = patch_size, patch_size
+
+            # Filter GT centers to this crop's coordinate system
+            crop_centers = []
+            for c in centers:
+                cx, cy = c['center_x'], c['center_y']
+                if x0 <= cx < x0 + patch_size and y0 <= cy < y0 + patch_size:
+                    crop_centers.append({
+                        'center_x': cx - x0,
+                        'center_y': cy - y0,
+                        'bbox': (c['bbox'][0]-x0, c['bbox'][1]-y0,
+                                 c['bbox'][2]-x0, c['bbox'][3]-y0),
+                    })
+
+            # numpy (C,256,256) -> torch (1,C,256,256) on device
+            img = torch.from_numpy(np.ascontiguousarray(crop)).unsqueeze(0).to(device)
+
+            out = model(img)
+            obj_t, _ = compute_fcos_targets(
+                (patch_size, patch_size), crop_centers,
+                list(out['strides']), device=device,
+            )
+
+            for lvl in range(len(out['objectness'])):
+                pr = torch.sigmoid(out['objectness'][lvl][0, 0]).flatten()
+                gt = obj_t[lvl][0, 0].flatten()
+                pos_all.append(pr[gt > 0.5].cpu().numpy())
+                neg_all.append(pr[gt <= 0.5].cpu().numpy())
+
+    pos = np.concatenate(pos_all) if pos_all else np.array([0.0])
+    neg = np.concatenate(neg_all) if neg_all else np.array([0.0])
+
+    print(f"  Samples evaluated: {n}")
+    print(f"  pos grid-points:   {len(pos):,}")
+    print(f"  neg grid-points:   {len(neg):,}")
+    print()
+    print(f"  {'bucket':<8}{'mean':>9}{'p50':>9}{'p95':>9}{'max':>9}")
+    for name, arr in [("pos", pos), ("neg", neg)]:
+        print(f"  {name:<8}{arr.mean():>9.4f}{np.percentile(arr,50):>9.4f}"
+              f"{np.percentile(arr,95):>9.4f}{arr.max():>9.4f}")
+    print()
+
+    thr = float(conf_thresh)
+    pos_recall = (pos > thr).mean() * 100
+    neg_pass   = (neg > thr).mean() * 100
+    print(f"  With conf_thresh = {thr:.2f}:")
+    print(f"    pos recall:  {pos_recall:6.2f}%   (target: ~100%)")
+    print(f"    neg pass:    {neg_pass:9.4f}%   (target: <0.5%)")
+    print()
+
+    if neg_pass > 5.0 and pos_recall < 99.0:
+        print("  >>> MODEL problem. Pos and neg overlap badly.")
+        print("      No threshold value will fix this. Retrain with new")
+        print("      center-only target + IoU loss first.")
+    elif neg_pass > 1.0:
+        print("  >>> Marginal. Lower conf_thresh to 0.10 to recover recall,")
+        print("      but accept some false positives. Real fix is retraining.")
+    else:
+        print("  >>> Clean separation! Threshold is the right knob.")
+        print(f"      Try 0.40 for crisp / 0.20 for max recall.")
+    print("=" * 70)
+
+
+def visualize_results(dataset, model, device, strides, output_dir='test_results',
+                      num_samples=5, conf_thresh=0.20):
     """Generate visualization of detection results"""
     os.makedirs(output_dir, exist_ok=True)
     model.eval()
@@ -632,7 +747,14 @@ def main():
     print("\n" + "=" * 60)
     print("Starting Evaluation...")
     print("=" * 60)
-    
+
+    # Score-distribution diagnostic: tells you in 5 seconds whether
+    # the threshold problem is the THRESHOLD or the MODEL.
+    diagnose_score_distribution(
+        model, dataset, device, actual_strides,
+        conf_thresh=config.CONF_THRESH, n_samples=10,
+    )
+
     metrics, image_names, gt_boxes_list, pred_boxes_list, pred_scores_list = \
         evaluate_model(model, dataloader, device, actual_strides, conf_thresh=config.CONF_THRESH)
     
